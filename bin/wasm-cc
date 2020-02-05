@@ -1,0 +1,277 @@
+#!/bin/sh
+
+alias cc=clang
+alias dis=wasm-dis
+alias opt=wasm-opt
+
+find_library_path()
+{
+	cc -print-search-dirs | grep libraries | cut -d '=' -f2 | tr ':' '\n'
+
+	use_next=false
+
+	for i do
+		if [ $use_next = true ]; then
+			echo $i
+			use_next=false
+			continue
+		fi
+
+		case $i in
+		-L)
+			use_next=true
+			;;
+		-L*)
+			echo ${i:2}
+			;;
+		esac
+	done
+}
+
+find_output_option()
+{
+	output=""
+	use_next=false
+
+	for i do
+		if [ $use_next = true ]; then
+			output="$i"
+			use_next=false
+			continue
+		fi
+
+		case $i in
+		-o)
+			use_next=true
+			;;
+		-o*)
+			output=${i:2}
+			;;
+		esac
+	done
+
+	echo "$output"
+}
+
+filter_output_option()
+{
+	skip_next=false
+
+	for i do
+		if [ $skip_next = true ]; then
+			output="$i"
+			skip_next=false
+			continue
+		fi
+
+		case $i in
+		-o)
+			skip_next=true
+			;;
+		-o*)
+			;;
+		*)
+			echo "$i"
+			;;
+		esac
+	done
+}
+
+grep_module_dependencies()
+{
+	{ cut -d' ' -f1 $1; echo "env"; } | sort | uniq
+}
+
+print_module_imports()
+{
+	grep 'import ".*" ".*"' $1 | cut -d' ' -f3-4 | tr -d '"'
+}
+
+print_module_exports()
+{
+	grep -o 'export ".*"' $1 | cut -d' ' -f2 | tr -d '"'
+}
+
+print_module_import_statements()
+{
+	for i do
+		printf "import * as ${i} from './${i}.js'\n" 
+	done
+
+	printf "\n"
+}
+
+print_module_imports_object()
+{
+	printf "const importsObject = {\n"
+
+	if [ -f $2 ]; then
+
+		printf "\t'a': {\n"
+
+		cut -d' ' -f1 $1 | sort | uniq | while read module; do
+			grep "$module" -- $1 | sort | uniq | cut -d' ' -f2-3 | while read name; do
+				import_name=$(grep "$name" -- $2 | cut -d' ' -f3)
+
+				if [ -z $import_name ]; then
+					import_name=$name
+				fi
+
+				printf "\t\t'${import_name}': ${module}.${name},\n"
+			done
+		done
+
+		printf "\t},\n"
+	else
+		cut -d' ' -f1 $1 | sort | uniq | while read module; do
+			printf "\t'${module}': {\n"
+
+			grep "$module" -- $1 | sort | uniq | cut -d' ' -f2-3 | while read name; do
+				printf "\t\t'${name}': ${module}.${name},\n"
+			done
+
+			printf "\t},\n"
+		done
+	fi
+
+	printf "};\n\n"
+}
+
+print_module_buffer_source()
+{
+	printf 'let raw = self.atob("%s");\n' $(base64 $1)
+	printf 'let len = raw.length;\n'
+	printf 'let buf = new Uint8Array(new ArrayBuffer(len));\n'
+
+	printf 'for (let i = 0; i < len; i++) {'
+	printf '\tbuf[i] = raw.charCodeAt(i);'
+	printf '}'
+
+	printf "var bufferSource = buf;\n\n"
+}
+
+print_module_instantiation_object()
+{
+	printf "const WebAssembly = self['WebAssembly'];\n"
+	printf "const instantiate = WebAssembly['instantiate'];\n"
+
+	printf "instantiate(bufferStream, importsObject).then(function(result) {\n"
+	printf "\tconst exports = result['instance']['exports'];\n"
+	printf "\tconst instance = {\n"
+	printf "\t\texports: {\n"
+	cat $1 | while read name; do
+		export_name=name
+		if [ -s $2 ]; then
+			export_name=$(grep "$name" -- $2 | cut -d' ' -f3)
+
+			if [ -z $export_name ]; then
+				export_name=name
+			fi
+		fi
+
+		printf "\t\t$name: exports['$export_name'],\n"
+	done
+
+	printf "}\n"
+	printf "\t};\n"
+	printf "\tenv.run(instance);\n"
+	printf "});\n"
+}
+
+print_html_template()
+{
+	cat << EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta http-equiv="x-ua-compatible" content="ie=edge">
+	<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+	<title>$(basename $1)</title>
+	<script>
+$(cat $1)
+	</script>
+</head>
+<body>
+
+</body>
+</html>
+EOF
+}
+
+output=$(find_output_option $@)
+set -- $(filter_output_option $@)
+
+tmpdir="tmp"
+rm -rf $tmpdir
+mkdir -p $tmpdir
+
+cc -o ${tmpdir}/out.wasm $@
+
+dis -o ${tmpdir}/out.wast ${tmpdir}/out.wasm
+opt -o ${tmpdir}/out.min.wasm -O --minify-imports-and-exports-and-modules ${tmpdir}/out.wasm > ${tmpdir}/out.map
+
+print_module_exports ${tmpdir}/out.wast > ${tmpdir}/out.exports
+print_module_imports ${tmpdir}/out.wast > ${tmpdir}/out.imports
+
+module_names=$(grep_module_dependencies ${tmpdir}/out.imports)
+module_path=$(find_library_path $@)
+
+errors=""
+for module in ${module_names}; do
+	found=false
+	for dir in ${module_path}; do
+		file=${dir}/${module}.js
+
+		if [ -f $file ]; then
+			found=true
+			break
+		fi
+	done
+
+	if [ $found = false ]; then
+		errors="${errors}jsc: \x1b[31merror\x1b[0m: module not found for '$module'\n";
+		continue
+	fi
+
+	cp ${file} ${tmpdir}/$(basename $file)
+done
+
+if [ -n "$error" ]; then
+	printf "%s" $errors
+	exit 1
+fi
+
+(
+	print_module_import_statements ${module_names}
+	print_module_buffer_source ${tmpdir}/out.min.wasm
+
+	if [ -f ${tmpdir}/out.map ]; then
+		print_module_imports_object ${tmpdir}/out.imports ${tmpdir}/out.map
+		print_module_instantiation_object ${tmpdir}/out.exports ${tmpdir}/out.map
+	else
+		print_module_imports_object ${tmpdir}/out.imports
+		print_module_instantiation_object ${tmpdir}/out.exports
+	fi
+) > ${tmpdir}/out.js
+
+closure-compiler \
+	--formatting PRETTY_PRINT \
+	--compilation_level ADVANCED \
+	--language_in ECMASCRIPT_NEXT \
+	--language_out ECMASCRIPT_2018 \
+	--js_output_file ${tmpdir}/out.min.js \
+	${tmpdir}/*.js
+
+if [ $? -ne 0 ]; then
+	exit $?
+fi
+
+case $output in
+*.html)
+	print_html_template ${tmpdir}/out.min.js > $output
+	;;
+*.js)
+	cp ${tmpdir}/out.min.js $output
+	;;
+esac
